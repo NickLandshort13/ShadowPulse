@@ -14,10 +14,18 @@ import (
 	"time"
 
 	"github.com/urfave/cli/v2"
-	"golang.org/x/net/proxy"
 )
 
-var proxyChan = make(chan Proxy, 100)
+var (
+	debugMode      = true
+	proxyChainSize = 3
+)
+
+func debugLog(format string, args ...interface{}) {
+	if debugMode {
+		log.Printf("[DEBUG] "+format, args...)
+	}
+}
 
 var userAgents = []string{
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36",
@@ -49,8 +57,16 @@ func fetchProxiesFromURL(url string) ([]Proxy, error) {
 	for scanner.Scan() {
 		line := scanner.Text()
 		parts := strings.Split(line, ":")
-		if len(parts) == 2 {
-			proxies = append(proxies, Proxy{IP: parts[0], Port: parts[1], Protocol: "http"})
+		if len(parts) >= 2 {
+			protocol := "http"
+			if len(parts) > 2 {
+				protocol = parts[2]
+			}
+			proxies = append(proxies, Proxy{
+				IP:       parts[0],
+				Port:     parts[1],
+				Protocol: protocol,
+			})
 		}
 	}
 
@@ -65,7 +81,7 @@ func saveProxiesToFile(proxies []Proxy, filename string) error {
 	defer file.Close()
 
 	for _, p := range proxies {
-		_, err := file.WriteString(fmt.Sprintf("%s:%s\n", p.IP, p.Port))
+		_, err := file.WriteString(fmt.Sprintf("%s:%s:%s\n", p.IP, p.Port, p.Protocol))
 		if err != nil {
 			return err
 		}
@@ -85,8 +101,16 @@ func loadProxiesFromFile(filename string) ([]Proxy, error) {
 	for scanner.Scan() {
 		line := scanner.Text()
 		parts := strings.Split(line, ":")
-		if len(parts) == 2 {
-			proxies = append(proxies, Proxy{IP: parts[0], Port: parts[1], Protocol: "http"})
+		if len(parts) >= 2 {
+			protocol := "http"
+			if len(parts) > 2 {
+				protocol = parts[2]
+			}
+			proxies = append(proxies, Proxy{
+				IP:       parts[0],
+				Port:     parts[1],
+				Protocol: protocol,
+			})
 		}
 	}
 
@@ -94,11 +118,16 @@ func loadProxiesFromFile(filename string) ([]Proxy, error) {
 }
 
 func validateProxy(proxy Proxy, timeout time.Duration) bool {
-	proxyURL, _ := url.Parse(fmt.Sprintf("http://%s:%s", proxy.IP, proxy.Port))
+	proxyURL, err := url.Parse(fmt.Sprintf("%s://%s:%s", proxy.Protocol, proxy.IP, proxy.Port))
+	if err != nil {
+		debugLog("Invalid proxy URL: %v", err)
+		return false
+	}
+
 	client := &http.Client{
 		Transport: &http.Transport{
-			Proxy:           http.ProxyURL(proxyURL),
-			TLSClientConfig: nil,
+			Proxy:             http.ProxyURL(proxyURL),
+			DisableKeepAlives: true,
 		},
 		Timeout: timeout,
 	}
@@ -106,84 +135,156 @@ func validateProxy(proxy Proxy, timeout time.Duration) bool {
 	req, _ := http.NewRequest("GET", "http://checkip.amazonaws.com", nil)
 	req.Header.Set("User-Agent", getRandomUserAgent())
 
+	start := time.Now()
 	resp, err := client.Do(req)
+	duration := time.Since(start)
+
 	if err != nil {
+		debugLog("Proxy %s:%s failed in %v: %v", proxy.IP, proxy.Port, duration, err)
 		return false
 	}
 	defer resp.Body.Close()
 
+	debugLog("Proxy %s:%s succeeded in %v (status: %d)", proxy.IP, proxy.Port, duration, resp.StatusCode)
 	return resp.StatusCode == 200
 }
 
-func buildChainedProxy(proxies []Proxy) (*http.Client, error) {
+func buildChainedProxy(proxies []Proxy, chainSize int) (*http.Client, error) {
 	if len(proxies) == 0 {
 		return nil, fmt.Errorf("no proxies provided for chain")
 	}
 
-	dialer, err := proxy.SOCKS5("tcp", fmt.Sprintf("%s:%s", proxies[0].IP, proxies[0].Port), nil, proxy.Direct)
-	if err != nil {
-		return nil, err
+	if chainSize <= 0 {
+		chainSize = 1
+	}
+	if chainSize > len(proxies) {
+		chainSize = len(proxies)
 	}
 
-	for i := 1; i < len(proxies); i++ {
-		nextDialer, err := proxy.SOCKS5("tcp", fmt.Sprintf("%s:%s", proxies[i].IP, proxies[i].Port), nil, proxy.Direct)
-		if err != nil {
-			continue
-		}
-		dialer = nextDialer
+	rand.Seed(time.Now().UnixNano())
+	rand.Shuffle(len(proxies), func(i, j int) {
+		proxies[i], proxies[j] = proxies[j], proxies[i]
+	})
+	selectedProxies := proxies[:chainSize]
+
+	debugLog("Building proxy chain with %d proxies (selected from %d available):", chainSize, len(proxies))
+	for i, p := range selectedProxies {
+		debugLog("  %d: %s://%s:%s", i+1, p.Protocol, p.IP, p.Port)
 	}
 
 	transport := &http.Transport{
-		Dial: dialer.Dial,
+		DisableKeepAlives: true,
 	}
 
-	return &http.Client{
+	if chainSize == 1 {
+		proxyURL, err := url.Parse(fmt.Sprintf("%s://%s:%s", selectedProxies[0].Protocol, selectedProxies[0].IP, selectedProxies[0].Port))
+		if err != nil {
+			return nil, fmt.Errorf("invalid proxy URL: %v", err)
+		}
+		transport.Proxy = http.ProxyURL(proxyURL)
+	} else {
+		currentProxy := 0
+		transport.Proxy = func(req *http.Request) (*url.URL, error) {
+			proxy := selectedProxies[currentProxy]
+			currentProxy = (currentProxy + 1) % chainSize
+			return url.Parse(fmt.Sprintf("%s://%s:%s", proxy.Protocol, proxy.IP, proxy.Port))
+		}
+	}
+
+	client := &http.Client{
 		Transport: transport,
-		Timeout:   10 * time.Second,
-	}, nil
+		Timeout:   15 * time.Second,
+	}
+
+	debugLog("Proxy chain built successfully")
+	return client, nil
 }
 
 func scanDomain(client *http.Client, domain string) (string, error) {
-	req, err := http.NewRequest("GET", "https://"+domain, nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("User-Agent", getRandomUserAgent())
+	targetURL := "https://" + domain
+	debugLog("Initiating scan for: %s", targetURL)
 
-	resp, err := client.Do(req)
+	req, err := http.NewRequest("GET", targetURL, nil)
 	if err != nil {
-		return "", err
+		debugLog("Request creation failed for %s: %v", targetURL, err)
+		return "", fmt.Errorf("request creation failed: %v", err)
+	}
+
+	ua := getRandomUserAgent()
+	req.Header.Set("User-Agent", ua)
+	req.Header.Add("Accept-Encoding", "identity")
+	debugLog("Using User-Agent: %s", ua)
+
+	startTime := time.Now()
+	resp, err := client.Do(req)
+	duration := time.Since(startTime)
+
+	if err != nil {
+		debugLog("Request to %s failed after %v: %v", targetURL, duration, err)
+		return "", fmt.Errorf("request failed after %v: %v", duration, err)
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
+	debugLog("Received response from %s - Status: %d, Time: %v", targetURL, resp.StatusCode, duration)
+
+	if debugMode {
+		for k, v := range resp.Header {
+			debugLog("Response header %s: %v", k, v)
+		}
 	}
 
-	return fmt.Sprintf("Domain: %s | Status: %d | Length: %d | Sample: %.50s...", domain, resp.StatusCode, len(body), string(body)), nil
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
+	if err != nil {
+		debugLog("Failed reading body from %s: %v", targetURL, err)
+		return "", fmt.Errorf("reading body failed: %v", err)
+	}
+
+	debugLog("Successfully scanned %s (status: %d, length: %d)", targetURL, resp.StatusCode, len(body))
+	return fmt.Sprintf("Domain: %s | Status: %d | Length: %d | Sample: %.50s...",
+		domain, resp.StatusCode, len(body), string(body)), nil
+}
+
+func scanDomainWithRetry(client *http.Client, domain string, maxRetries int) (string, error) {
+	debugLog("Starting scan for %s (max retries: %d)", domain, maxRetries)
+
+	var lastErr error
+	for i := 0; i < maxRetries; i++ {
+		debugLog("Attempt %d/%d for %s", i+1, maxRetries, domain)
+		result, err := scanDomain(client, domain)
+		if err == nil {
+			return result, nil
+		}
+		lastErr = err
+		retryDelay := time.Second * time.Duration(i+1)
+		debugLog("Attempt %d failed: %v. Retrying in %v", i+1, err, retryDelay)
+		time.Sleep(retryDelay)
+	}
+
+	return "", fmt.Errorf("after %d attempts: %v", maxRetries, lastErr)
 }
 
 func updateProxies(c *cli.Context) error {
 	url := "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt"
+	debugLog("Fetching proxies from: %s", url)
+
 	proxies, err := fetchProxiesFromURL(url)
 	if err != nil {
-		log.Fatalf("Failed to fetch proxies: %v", err)
+		return fmt.Errorf("failed to fetch proxies: %v", err)
 	}
 
 	err = saveProxiesToFile(proxies, "proxies.txt")
 	if err != nil {
-		log.Fatalf("Failed to save proxies: %v", err)
+		return fmt.Errorf("failed to save proxies: %v", err)
 	}
 
-	fmt.Printf("Downloaded and saved %d proxies\n", len(proxies))
+	fmt.Printf("Downloaded and saved %d HTTP proxies\n", len(proxies))
 	return nil
 }
 
 func validateProxies(c *cli.Context) error {
 	proxies, err := loadProxiesFromFile("proxies.txt")
 	if err != nil {
-		log.Fatalf("Failed to load proxies: %v", err)
+		return fmt.Errorf("failed to load proxies: %v", err)
 	}
 
 	total := len(proxies)
@@ -193,7 +294,7 @@ func validateProxies(c *cli.Context) error {
 	validChan := make(chan Proxy, 1000)
 	progressChan := make(chan int, 1000)
 
-	numWorkers := 1000
+	numWorkers := 50
 	var wg sync.WaitGroup
 
 	for i := 0; i < numWorkers; i++ {
@@ -201,7 +302,7 @@ func validateProxies(c *cli.Context) error {
 		go func() {
 			defer wg.Done()
 			for proxy := range proxyChan {
-				if validateProxy(proxy, 5*time.Second) {
+				if validateProxy(proxy, 10*time.Second) {
 					validChan <- proxy
 				}
 				progressChan <- 1
@@ -224,7 +325,7 @@ func validateProxies(c *cli.Context) error {
 	}()
 
 	count := 0
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
 	for count < total {
@@ -246,38 +347,44 @@ func validateProxies(c *cli.Context) error {
 
 	err = saveProxiesToFile(validProxies, "valid_proxies.txt")
 	if err != nil {
-		log.Fatalf("Failed to save valid proxies: %v", err)
+		return fmt.Errorf("failed to save valid proxies: %v", err)
 	}
 
 	return nil
 }
 
-func scanDomains(c *cli.Context) error {
-	domainsFile := c.String("domains")
-	if domainsFile == "" {
-		log.Fatal("Please provide a domains file using --domains")
-	}
-
+func scanDomains(domainsFile string, chainSize int) error {
+	debugLog("Reading domains from file: %s", domainsFile)
 	domainsBytes, err := os.ReadFile(domainsFile)
 	if err != nil {
-		log.Fatalf("Failed to read domains file: %v", err)
+		return fmt.Errorf("failed to read domains file: %v", err)
 	}
 
 	domains := strings.Split(string(domainsBytes), "\n")
+	debugLog("Loaded %d domains to scan", len(domains))
 
 	validProxies, err := loadProxiesFromFile("valid_proxies.txt")
 	if err != nil {
-		log.Fatalf("Failed to load valid proxies: %v", err)
+		return fmt.Errorf("failed to load valid proxies: %v", err)
 	}
 
-	if len(validProxies) < 2 {
-		log.Fatal("Need at least 2 valid proxies to build a chain")
+	if len(validProxies) == 0 {
+		return fmt.Errorf("no valid proxies available")
 	}
 
-	client, err := buildChainedProxy(validProxies[:2])
+	debugLog("Building proxy client with chain size %d (from %d available proxies)", chainSize, len(validProxies))
+	client, err := buildChainedProxy(validProxies, chainSize)
 	if err != nil {
-		log.Fatalf("Failed to build proxy chain: %v", err)
+		return fmt.Errorf("failed to build proxy client: %v", err)
 	}
+
+	debugLog("Testing proxy connectivity with https://httpbin.org/ip...")
+	testResult, testErr := scanDomainWithRetry(client, "httpbin.org/ip", 2)
+	if testErr != nil {
+		debugLog("Proxy test failed: %v", testErr)
+		return fmt.Errorf("proxy test failed: %v", testErr)
+	}
+	debugLog("Proxy test successful: %s", testResult)
 
 	for _, domain := range domains {
 		domain = strings.TrimSpace(domain)
@@ -285,8 +392,10 @@ func scanDomains(c *cli.Context) error {
 			continue
 		}
 
-		result, err := scanDomain(client, domain)
+		debugLog("\nStarting scan for domain: %s", domain)
+		result, err := scanDomainWithRetry(client, domain, 2)
 		if err != nil {
+			debugLog("Scan failed for %s: %v", domain, err)
 			fmt.Printf("Error scanning %s: %v\n", domain, err)
 			continue
 		}
@@ -299,12 +408,24 @@ func scanDomains(c *cli.Context) error {
 
 func main() {
 	app := &cli.App{
-		Name:  "proxyctl",
-		Usage: "A tool for managing and using proxy servers",
+		Name:    "proxyctl",
+		Version: "1.0",
+		Usage:   "A tool for managing and using proxy servers",
+		Flags: []cli.Flag{
+			&cli.BoolFlag{
+				Name:    "debug",
+				Aliases: []string{"d"},
+				Usage:   "Enable debug mode",
+			},
+		},
+		Before: func(c *cli.Context) error {
+			debugMode = c.Bool("debug")
+			return nil
+		},
 		Commands: []*cli.Command{
 			{
 				Name:   "update",
-				Usage:  "Fetch and save the latest list of HTTP proxies from TheSpeedX",
+				Usage:  "Fetch and save the latest list of HTTP proxies",
 				Action: updateProxies,
 			},
 			{
@@ -321,14 +442,28 @@ func main() {
 						Usage:    "Path to file containing domains to scan",
 						Required: true,
 					},
+					&cli.IntFlag{
+						Name:    "chain",
+						Aliases: []string{"c"},
+						Usage:   "Number of proxies in chain (1-10)",
+						Value:   3,
+					},
 				},
-				Action: scanDomains,
+				Action: func(c *cli.Context) error {
+					chainSize := c.Int("chain")
+					if chainSize < 1 || chainSize > 10 {
+						return cli.Exit("Chain size must be between 1 and 10", 1)
+					}
+
+					domainsFile := c.String("domains")
+
+					return scanDomains(domainsFile, chainSize)
+				},
 			},
 		},
 	}
 
-	err := app.Run(os.Args)
-	if err != nil {
+	if err := app.Run(os.Args); err != nil {
 		log.Fatal(err)
 	}
 }
