@@ -9,6 +9,6 @@ import (
 
 func main() {
 	router := api.NewRouter()
-	log.Println("ShadowPulse запущен на :8080")
+	log.Println("ShadowPulse server starting on :8080")
 	log.Fatal(http.ListenAndServe(":8080", router))
 }

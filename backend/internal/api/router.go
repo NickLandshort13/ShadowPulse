@@ -6,22 +6,29 @@ import (
 
 	"github.com/NickLandshort13/ShadowPulse/internal/proxy"
 	"github.com/gorilla/mux"
+	"github.com/rs/cors"
 )
 
-type ProxyResponse struct {
-	IP      string  `json:"ip"`
-	Latency int     `json:"latency"`
-	Lat     float64 `json:"lat"`
-	Lng     float64 `json:"lng"`
-}
-
-func NewRouter() *mux.Router {
+func NewRouter() http.Handler {
 	r := mux.NewRouter()
 
 	r.HandleFunc("/api/proxies", func(w http.ResponseWriter, r *http.Request) {
-		proxies := proxy.GetActiveProxies()
+		proxies, err := proxy.FetchProxies()
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(proxies)
-	}).Methods("GET")
+	}).Methods("GET", "OPTIONS")
 
-	return r
+	c := cors.New(cors.Options{
+		AllowedOrigins:   []string{"*"},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"Content-Type"},
+		AllowCredentials: true,
+	})
+
+	return c.Handler(r)
 }
