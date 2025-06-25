@@ -6,14 +6,15 @@ import (
 
 	"github.com/NickLandshort13/ShadowPulse/internal/proxy"
 	"github.com/gorilla/mux"
+	"github.com/oschwald/geoip2-golang"
 	"github.com/rs/cors"
 )
 
-func NewRouter() http.Handler {
+func NewRouter(db *geoip2.Reader) http.Handler {
 	r := mux.NewRouter()
 
 	r.HandleFunc("/api/proxies", func(w http.ResponseWriter, r *http.Request) {
-		proxies, err := proxy.FetchProxies()
+		proxies, err := proxy.FetchProxies(db)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
@@ -21,13 +22,11 @@ func NewRouter() http.Handler {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(proxies)
-	}).Methods("GET", "OPTIONS")
+	}).Methods("GET")
 
 	c := cors.New(cors.Options{
-		AllowedOrigins:   []string{"*"},
-		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"Content-Type"},
-		AllowCredentials: true,
+		AllowedOrigins: []string{"*"},
+		AllowedMethods: []string{"GET"},
 	})
 
 	return c.Handler(r)

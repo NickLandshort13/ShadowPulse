@@ -3,61 +3,83 @@ package proxy
 import (
 	"encoding/json"
 	"fmt"
-	"io"
+	"net"
 	"net/http"
+	"time"
+
+	"github.com/oschwald/geoip2-golang"
 )
 
 type Proxy struct {
-	IP      string  `json:"ip"`
-	Port    int     `json:"port"`
-	Latency int     `json:"latency"`
-	Country string  `json:"country"`
-	Lat     float64 `json:"lat"`
-	Lng     float64 `json:"lng"`
+	IP        string    `json:"ip"`
+	Port      int       `json:"port"`
+	Latency   int       `json:"latency"`
+	Country   string    `json:"country"`
+	City      string    `json:"city"`
+	Lat       float64   `json:"lat"`
+	Lng       float64   `json:"lng"`
+	Type      string    `json:"type"`
+	LastCheck time.Time `json:"lastCheck"`
 }
 
-func FetchProxies() ([]Proxy, error) {
-	resp, err := http.Get("https://proxylist.geonode.com/api/proxy-list?limit=50&page=1")
+func FetchProxies(db *geoip2.Reader) ([]Proxy, error) {
+	resp, err := http.Get("https://proxylist.geonode.com/api/proxy-list?limit=500&page=1")
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
 	var response struct {
 		Data []struct {
-			IP      string  `json:"ip"`
-			Port    string  `json:"port"`
-			Latency float64 `json:"latency"`
-			Country string  `json:"country"`
-			Geo     struct {
-				Lat float64 `json:"lat"`
-				Lon float64 `json:"lon"`
-			} `json:"geo"`
+			IP        string   `json:"ip"`
+			Port      string   `json:"port"`
+			Latency   float64  `json:"latency"`
+			Protocols []string `json:"protocols"`
 		} `json:"data"`
 	}
 
-	if err := json.Unmarshal(body, &response); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
 		return nil, err
 	}
 
 	var proxies []Proxy
 	for _, p := range response.Data {
 		port := 0
-		if _, err := fmt.Sscanf(p.Port, "%d", &port); err == nil {
-			proxies = append(proxies, Proxy{
-				IP:      p.IP,
-				Port:    port,
-				Latency: int(p.Latency),
-				Country: p.Country,
-				Lat:     p.Geo.Lat,
-				Lng:     p.Geo.Lon,
-			})
+		if _, err := fmt.Sscanf(p.Port, "%d", &port); err != nil {
+			continue
 		}
+
+		ip := net.ParseIP(p.IP)
+		if ip == nil {
+			continue
+		}
+
+		record, err := db.City(ip)
+		if err != nil {
+			continue
+		}
+
+		proxyType := "http"
+		if len(p.Protocols) > 0 {
+			proxyType = p.Protocols[0]
+		}
+
+		cityName := "N/A"
+		if len(record.City.Names) > 0 {
+			cityName = record.City.Names["en"]
+		}
+
+		proxies = append(proxies, Proxy{
+			IP:        p.IP,
+			Port:      port,
+			Latency:   int(p.Latency),
+			Country:   record.Country.Names["en"],
+			City:      cityName,
+			Lat:       record.Location.Latitude,
+			Lng:       record.Location.Longitude,
+			Type:      proxyType,
+			LastCheck: time.Now(),
+		})
 	}
 
 	return proxies, nil
